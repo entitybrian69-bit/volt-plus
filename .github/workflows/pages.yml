@@ -5,6 +5,7 @@ on:
     branches: [android, arena/16c8aaea-volt-plus]
     paths:
       - 'website/**'
+      - 'tools/build_pages_site.py'
       - '.github/workflows/pages.yml'
   release:
     types: [published, released, edited]
@@ -34,175 +35,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prepare _site directory
-        run: |
-          rm -rf _site
-          mkdir -p _site/downloads _site/assets/media
-          cp -r website/. _site/
-          cp packaging/android/media/intro.mp4 _site/assets/media/intro.mp4
-          touch _site/.nojekyll
-
-      - name: Fetch latest stable Release APKs (Release only, no debug, no pre-release)
+      - name: Prepare _site with latest Release APKs
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, re, shutil, subprocess, tempfile, urllib.request
-          from pathlib import Path
+        run: python3 tools/build_pages_site.py --repo "${{ github.repository }}"
 
-          repo = os.environ['REPO']
-          token = os.environ['GH_TOKEN']
-          out_dir = Path('_site/downloads')
-          disallowed = re.compile(r'(debug|dev|pre[-_.]?release|alpha|beta|rc\d*|nightly|snapshot|canary|unsigned)', re.I)
-
-          def api_get(url):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      'Authorization': f'Bearer {token}',
-                      'Accept': 'application/vnd.github+json',
-                      'User-Agent': 'VoltPlus-Pages-Sync',
-                  },
-              )
-              with urllib.request.urlopen(req, timeout=30) as resp:
-                  return json.loads(resp.read().decode('utf-8'))
-
-          def download_file(url, dest):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      'Authorization': f'Bearer {token}',
-                      'Accept': 'application/octet-stream',
-                      'User-Agent': 'VoltPlus-Pages-Sync',
-                  },
-              )
-              with urllib.request.urlopen(req, timeout=180) as resp, open(dest, 'wb') as f:
-                  shutil.copyfileobj(resp, f)
-
-          def match_abi(name):
-              lower = name.lower()
-              if not lower.endswith('.apk') or disallowed.search(lower):
-                  return None
-              if 'universal' in lower:
-                  return 'universal'
-              if 'arm64' in lower or 'aarch64' in lower:
-                  return 'arm64'
-              if 'armeabi-v7a' in lower or 'armv7' in lower or 'armeabi' in lower:
-                  return 'armv7'
-              return None
-
-          target_names = {
-              'arm64': 'Volt-Plus-arm64-v8a.apk',
-              'armv7': 'Volt-Plus-armeabi-v7a.apk',
-              'universal': 'Volt-Plus-universal.apk',
-          }
-
-          releases = api_get(f'https://api.github.com/repos/{repo}/releases?per_page=30')
-          selected_release = None
-          selected_assets = {}
-          for rel in releases:
-              if rel.get('draft') or rel.get('prerelease'):
-                  continue
-              tag_text = f"{rel.get('tag_name', '')} {rel.get('name', '')}"
-              if disallowed.search(tag_text):
-                  continue
-              found = {}
-              for asset in rel.get('assets', []):
-                  abi = match_abi(asset.get('name', ''))
-                  if abi and abi not in found:
-                      found[abi] = asset
-              if any(k in found for k in ('arm64', 'armv7', 'universal')):
-                  selected_release = rel
-                  selected_assets = found
-                  break
-
-          manifest = {
-              'status': 'pending_deploy',
-              'tag_name': 'v1.0',
-              'version': '1.0',
-              'name': 'Volt Plus Release',
-              'published_at': '',
-              'notes': 'Official signed Release APK builds (64-bit arm64-v8a, 32-bit armeabi-v7a, and Universal).',
-              'assets': {},
-          }
-
-          if selected_release is not None:
-              tag = selected_release.get('tag_name', 'v1.0').strip()
-              manifest.update({
-                  'status': 'ready',
-                  'tag_name': tag,
-                  'version': tag.lstrip('vV'),
-                  'name': selected_release.get('name') or tag,
-                  'published_at': selected_release.get('published_at') or '',
-                  'notes': selected_release.get('body') or manifest['notes'],
-              })
-              for abi, asset in selected_assets.items():
-                  dest = out_dir / target_names[abi]
-                  print(f'Downloading release asset {asset["name"]} -> {dest}', flush=True)
-                  download_file(asset['url'], dest)
-                  data = dest.read_bytes()
-                  manifest['assets'][abi] = {
-                      'filename': target_names[abi],
-                      'url': f'./downloads/{target_names[abi]}',
-                      'size_bytes': len(data),
-                      'size_mb': f'{len(data) / (1024 * 1024):.1f} MB',
-                      'sha256': hashlib.sha256(data).hexdigest(),
-                  }
-          else:
-              # No GitHub Release exists yet: use ONLY the latest green release-profile Volt Plus APK run
-              # (never debug / android-dev builds). Once a GitHub Release is published, Releases always take priority.
-              runs = json.loads(subprocess.check_output([
-                  'gh', 'run', 'list', '--repo', repo, '--workflow', 'volt-plus.yml',
-                  '--status', 'success', '--limit', '15', '--json', 'databaseId,createdAt,headSha',
-              ], text=True))
-              with tempfile.TemporaryDirectory() as tmp:
-                  for run in runs:
-                      run_dir = Path(tmp) / str(run['databaseId'])
-                      res = subprocess.run([
-                          'gh', 'run', 'download', str(run['databaseId']), '--repo', repo, '--dir', str(run_dir),
-                      ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                      if res.returncode != 0:
-                          continue
-                      found_files = {}
-                      is_release_profile = True
-                      for build_json in run_dir.rglob('BUILD.json'):
-                          meta = json.loads(build_json.read_text())
-                          if meta.get('profile') != 'release':
-                              is_release_profile = False
-                              break
-                      if not is_release_profile:
-                          continue
-                      for apk in run_dir.rglob('*.apk'):
-                          abi = match_abi(apk.name)
-                          if abi and abi not in found_files:
-                              found_files[abi] = apk
-                      if len(found_files) == 3:
-                          sha_short = (run.get('headSha') or '')[:7]
-                          manifest.update({
-                              'status': 'ready',
-                              'tag_name': f'v1.0 ({sha_short})' if sha_short else 'v1.0',
-                              'version': '1.0',
-                              'name': 'Volt Plus Release 1.0',
-                              'published_at': run.get('createdAt') or '',
-                              'notes': f'Latest signed Release build (commit {sha_short}). Official Release channel — no debug, no pre-release.',
-                          })
-                          for abi, apk in found_files.items():
-                              dest = out_dir / target_names[abi]
-                              shutil.copyfile(apk, dest)
-                              data = dest.read_bytes()
-                              manifest['assets'][abi] = {
-                                  'filename': target_names[abi],
-                                  'url': f'./downloads/{target_names[abi]}',
-                                  'size_bytes': len(data),
-                                  'size_mb': f'{len(data) / (1024 * 1024):.1f} MB',
-                                  'sha256': hashlib.sha256(data).hexdigest(),
-                              }
-                          break
-
-          Path('_site/latest-release.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          print('Prepared latest-release.json:', json.dumps({k: v for k, v in manifest.items() if k != 'notes'}, indent=2))
-          PY
+      - name: Avoid racing legacy GitHub Pages branch sync on push
+        if: github.event_name == 'push'
+        run: sleep 45
 
       - name: Ensure GitHub Pages uses workflow deployment
         env:

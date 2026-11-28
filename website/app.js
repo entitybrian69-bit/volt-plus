@@ -1,10 +1,6 @@
 (() => {
   'use strict';
 
-  const REPO = 'entitybrian69-bit/volt-plus';
-  const RELEASES_API = `https://api.github.com/repos/${REPO}/releases?per_page=20`;
-  const DISALLOWED_RE = /(debug|dev|pre[-_.]?release|alpha|beta|rc\d*|nightly|snapshot|canary|unsigned)/i;
-
   const THEMES = [
     { id: 'greenhouse', label: 'Greenhouse', bg: 'assets/screen-launcher.jpg' },
     { id: 'sakura', label: 'Sakura', bg: 'assets/screen-shaders.jpg' },
@@ -378,23 +374,6 @@
     }
   };
 
-  function isStableRelease(rel) {
-    if (!rel || rel.draft || rel.prerelease) return false;
-    return !DISALLOWED_RE.test(`${rel.tag_name || ''} ${rel.name || ''}`);
-  }
-
-  function matchAssetAbi(assets, abi) {
-    if (!Array.isArray(assets)) return null;
-    const valid = assets.filter((a) => {
-      const n = (a.name || '').toLowerCase();
-      return n.endsWith('.apk') && !DISALLOWED_RE.test(n);
-    });
-    if (abi === 'arm64') return valid.find((a) => /arm64|aarch64/i.test(a.name));
-    if (abi === 'armv7') return valid.find((a) => /armeabi-v7a|armv7|armeabi/i.test(a.name));
-    if (abi === 'universal') return valid.find((a) => /universal/i.test(a.name));
-    return null;
-  }
-
   function formatMb(bytes) {
     if (!bytes || !Number.isFinite(bytes)) return '—';
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -454,6 +433,36 @@
     updateHeroSmartButton();
   }
 
+  function normalizeDirectAsset(entry, fallbackFilename) {
+    const filename = entry?.filename || fallbackFilename;
+    const rawUrl = entry?.url || '';
+    const safeUrl = rawUrl.startsWith('./downloads/') || rawUrl.startsWith('downloads/')
+      ? rawUrl
+      : `./downloads/${filename}`;
+    return {
+      filename,
+      url: safeUrl,
+      sizeMb: entry?.size_mb || formatMb(entry?.size_bytes),
+      sha256: entry?.sha256 || 'Verified SHA-256'
+    };
+  }
+
+  async function probeDirectApk(abi) {
+    const asset = currentReleaseState.assets[abi];
+    if (!asset) return false;
+    try {
+      const res = await fetch(`${asset.url}?t=${Date.now()}`, { method: 'HEAD', cache: 'no-store' });
+      if (!res.ok) return false;
+      const len = Number(res.headers.get('content-length'));
+      if (Number.isFinite(len) && len > 0 && (!asset.sizeMb || asset.sizeMb.startsWith('~'))) {
+        asset.sizeMb = formatMb(len);
+      }
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function syncLatestRelease() {
     let baked = null;
     try {
@@ -468,102 +477,56 @@
         tag: baked.tag_name || 'v1.0',
         publishedAt: baked.published_at || '',
         assets: {
-          arm64: {
-            filename: baked.assets.arm64?.filename || 'Volt-Plus-arm64-v8a.apk',
-            url: baked.assets.arm64?.url || './downloads/Volt-Plus-arm64-v8a.apk',
-            sizeMb: baked.assets.arm64?.size_mb || formatMb(baked.assets.arm64?.size_bytes),
-            sha256: baked.assets.arm64?.sha256 || 'Verified SHA-256'
-          },
-          armv7: {
-            filename: baked.assets.armv7?.filename || 'Volt-Plus-armeabi-v7a.apk',
-            url: baked.assets.armv7?.url || './downloads/Volt-Plus-armeabi-v7a.apk',
-            sizeMb: baked.assets.armv7?.size_mb || formatMb(baked.assets.armv7?.size_bytes),
-            sha256: baked.assets.armv7?.sha256 || 'Verified SHA-256'
-          },
-          universal: {
-            filename: baked.assets.universal?.filename || 'Volt-Plus-universal.apk',
-            url: baked.assets.universal?.url || './downloads/Volt-Plus-universal.apk',
-            sizeMb: baked.assets.universal?.size_mb || formatMb(baked.assets.universal?.size_bytes),
-            sha256: baked.assets.universal?.sha256 || 'Verified SHA-256'
-          }
+          arm64: normalizeDirectAsset(baked.assets.arm64, 'Volt-Plus-arm64-v8a.apk'),
+          armv7: normalizeDirectAsset(baked.assets.armv7, 'Volt-Plus-armeabi-v7a.apk'),
+          universal: normalizeDirectAsset(baked.assets.universal, 'Volt-Plus-universal.apk')
         }
       };
-    }
-
-    try {
-      const apiRes = await fetch(RELEASES_API, {
-        headers: { Accept: 'application/vnd.github+json' },
-        cache: 'no-store'
-      });
-      if (apiRes.ok) {
-        const list = await apiRes.json();
-        const stable = Array.isArray(list) ? list.find(isStableRelease) : null;
-        if (stable) {
-          const a64 = matchAssetAbi(stable.assets, 'arm64');
-          const a32 = matchAssetAbi(stable.assets, 'armv7');
-          const aUni = matchAssetAbi(stable.assets, 'universal');
-          if (a64 || a32 || aUni) {
-            const matchesBaked = baked && baked.tag_name === stable.tag_name && baked.status === 'ready';
-            currentReleaseState.ready = true;
-            currentReleaseState.tag = stable.tag_name;
-            currentReleaseState.version = stable.tag_name.replace(/^v/i, '');
-            currentReleaseState.publishedAt = stable.published_at;
-
-            if (a64) {
-              currentReleaseState.assets.arm64 = {
-                filename: matchesBaked ? baked.assets.arm64.filename : a64.name,
-                url: matchesBaked ? baked.assets.arm64.url : a64.browser_download_url,
-                sizeMb: formatMb(a64.size),
-                sha256: matchesBaked ? baked.assets.arm64.sha256 : (a64.digest || 'Release verified')
-              };
-            }
-            if (a32) {
-              currentReleaseState.assets.armv7 = {
-                filename: matchesBaked ? baked.assets.armv7.filename : a32.name,
-                url: matchesBaked ? baked.assets.armv7.url : a32.browser_download_url,
-                sizeMb: formatMb(a32.size),
-                sha256: matchesBaked ? baked.assets.armv7.sha256 : (a32.digest || 'Release verified')
-              };
-            }
-            if (aUni) {
-              currentReleaseState.assets.universal = {
-                filename: matchesBaked ? baked.assets.universal.filename : aUni.name,
-                url: matchesBaked ? baked.assets.universal.url : aUni.browser_download_url,
-                sizeMb: formatMb(aUni.size),
-                sha256: matchesBaked ? baked.assets.universal.sha256 : (aUni.digest || 'Release verified')
-              };
-            }
-          }
-        }
+    } else {
+      const probes = await Promise.all(['arm64', 'armv7', 'universal'].map((abi) => probeDirectApk(abi)));
+      if (probes.every(Boolean)) {
+        currentReleaseState.ready = true;
       }
-    } catch (_) {}
+    }
 
     renderReleaseState();
   }
 
+  function triggerDirectDownload(asset) {
+    const a = document.createElement('a');
+    a.href = asset.url;
+    a.download = asset.filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
+  }
+
   document.querySelectorAll('.js-apk-download').forEach((link) => {
-    link.addEventListener('click', (e) => {
+    link.addEventListener('click', async (e) => {
       const abi = link.dataset.abi || 'arm64';
       const asset = currentReleaseState.assets[abi] || currentReleaseState.assets.arm64;
-      if (!currentReleaseState.ready) {
-        e.preventDefault();
-        showToast('Syncing Release...', 'GitHub Pages is finalizing the latest APK build.');
+      if (currentReleaseState.ready) {
+        showToast(
+          `Downloading ${asset.filename}`,
+          `${currentReleaseState.tag} (${asset.sizeMb}) started directly.`
+        );
         return;
       }
 
-      if (/^https?:\/\//i.test(asset.url) && !asset.url.startsWith(window.location.origin)) {
-        e.preventDefault();
-        const frame = document.createElement('iframe');
-        frame.style.display = 'none';
-        frame.src = asset.url;
-        document.body.appendChild(frame);
-        setTimeout(() => frame.remove(), 30000);
+      e.preventDefault();
+      const exists = await probeDirectApk(abi);
+      if (exists) {
+        currentReleaseState.ready = true;
+        renderReleaseState();
+        triggerDirectDownload(asset);
+        showToast(
+          `Downloading ${asset.filename}`,
+          `${currentReleaseState.tag} (${asset.sizeMb}) started directly.`
+        );
+      } else {
+        showToast('Build In Progress', 'New release APKs are currently building — please try again shortly.');
       }
-
-      showToast(
-        `Downloading ${asset.filename}`,
-        `${currentReleaseState.tag} (${asset.sizeMb}) started directly.`
-      );
     });
   });
 
